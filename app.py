@@ -24,7 +24,7 @@ db.init_app(app)
 
 # Allow your frontend origins explicitly
 # Allow all origins for development to avoid issues with file:// or different ports
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # Create tables
 with app.app_context():
@@ -204,6 +204,45 @@ def add_news():
         db.session.add(new_news)
         db.session.commit()
         return jsonify({"message": "News added successfully!"}), 201
+
+
+@app.route('/api/news/<int:id>', methods=['PUT'])
+@login_required # ONLY ADMIN CAN EDIT
+def update_news(id):
+    news_item = News.query.get_or_404(id)
+    
+    title = request.form.get('title')
+    content = request.form.get('content')
+    image = request.files.get('image')
+
+    if title:
+        news_item.title = title
+    if content:
+        news_item.content = content
+        
+    if image and image.filename != '':
+        # Generate unique filename for new image
+        filename = secure_filename(image.filename)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        unique_filename = f"news_{timestamp}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        image.save(file_path)
+        
+        # Delete old image if it was a local file
+        if news_item.image_url and not news_item.image_url.startswith('http'):
+             # Note: image_url might be just filename or path. 
+             # We store just filename usually.
+             old_file_path = os.path.join(app.config['UPLOAD_FOLDER'], news_item.image_url)
+             if os.path.exists(old_file_path):
+                 try:
+                    os.remove(old_file_path)
+                 except:
+                    pass # Ignore error if file doesn't exist
+        
+        news_item.image_url = unique_filename
+
+    db.session.commit()
+    return jsonify({"message": "News updated successfully!", "news": news_item.to_dict()}), 200
 
 @app.route('/api/news/<int:id>', methods=['DELETE'])
 @login_required # ONLY ADMIN CAN DELETE
