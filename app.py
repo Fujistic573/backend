@@ -160,6 +160,14 @@ def get_news():
         'pages': (total + limit - 1) // limit
     })
 
+# Get single news by ID
+@app.route('/api/news/<int:news_id>', methods=['GET'])
+def get_single_news(news_id):
+    news = News.query.get(news_id)
+    if not news:
+        return jsonify({'error': 'News not found'}), 404
+    return jsonify(news.to_dict())
+
 @app.route('/api/news', methods=['POST'])
 @app.route('/api/news', methods=['POST'])
 def add_news():
