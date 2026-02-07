@@ -10,6 +10,7 @@ class News(db.Model):
     image_url = db.Column(db.String(500))
     date_posted = db.Column(db.DateTime, default=datetime.utcnow)
     source_link = db.Column(db.String(500))  # Link to Facebook post if applicable
+    is_featured = db.Column(db.Boolean, default=False)  # For pinned/featured news
 
     def to_dict(self):
         return {
@@ -18,7 +19,8 @@ class News(db.Model):
             'content': self.content,
             'image_url': self.image_url,
             'date_posted': self.date_posted.strftime('%Y-%m-%d %H:%M:%S'),
-            'source_link': self.source_link
+            'source_link': self.source_link,
+            'is_featured': self.is_featured
         }
 
 class ContactMessage(db.Model):

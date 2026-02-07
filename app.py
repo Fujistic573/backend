@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify, session, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 from database import db, News, ContactMessage, User, GalleryImage
+from cloud_storage import upload_file_to_cloud, delete_file_from_cloud, extract_filename_from_url
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import datetime
@@ -131,8 +132,33 @@ def login_required(f):
 # --- NEWS ROUTES ---
 @app.route('/api/news', methods=['GET'])
 def get_news():
-    news_list = News.query.order_by(News.date_posted.desc()).all()
-    return jsonify([news.to_dict() for news in news_list])
+    # Get query parameters
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 10, type=int)
+    search = request.args.get('search', '', type=str)
+    
+    # Build query
+    query = News.query
+    
+    # Apply search filter if provided
+    if search:
+        search_filter = f"%{search}%"
+        query = query.filter((News.title.like(search_filter)) | (News.content.like(search_filter)))
+    
+    # Order and get total
+    query = query.order_by(News.date_posted.desc())
+    total = query.count()
+    
+    # Apply pagination
+    news_items = query.offset((page - 1) * limit).limit(limit).all()
+    
+    return jsonify({
+        'news': [news.to_dict() for news in news_items],
+        'total': total,
+        'page': page,
+        'limit': limit,
+        'pages': (total + limit - 1) // limit
+    })
 
 @app.route('/api/news', methods=['POST'])
 @app.route('/api/news', methods=['POST'])
@@ -184,16 +210,15 @@ def add_news():
             filename = secure_filename(file.filename)
             timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
             unique_filename = f"news_{timestamp}_{filename}"
-            upload_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-            os.makedirs(os.path.dirname(upload_path), exist_ok=True)
-            file.save(upload_path)
-            # Store relative path for frontend to use
-            # We will serve this via the /uploads route or /api/uploads
-            # Actually, standardizing on full URL generation in frontend is better, 
-            # but let's store the filename or relative path that our frontend expects.
-            # The gallery stores just filename using `timestamp_filename`. 
-            # We'll do same here for consistency.
-            image_path = unique_filename
+            
+            # Upload to R2 cloud storage instead of local folder
+            try:
+                file_data = file.read()
+                content_type = file.content_type or 'image/jpeg'
+                cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
+                image_path = cloud_url  # Store full cloud URL
+            except Exception as e:
+                return jsonify({"message": f"Failed to upload image: {str(e)}"}), 500
             
         new_news = News(
             title=title,
@@ -225,22 +250,27 @@ def update_news(id):
         filename = secure_filename(image.filename)
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         unique_filename = f"news_{timestamp}_{filename}"
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        image.save(file_path)
         
-        # Delete old image if it was a local file
-        if news_item.image_url and not news_item.image_url.startswith('http'):
-             # Note: image_url might be just filename or path. 
-             # We store just filename usually.
-             old_file_path = os.path.join(app.config['UPLOAD_FOLDER'], news_item.image_url)
-             if os.path.exists(old_file_path):
-                 try:
-                    os.remove(old_file_path)
-                 except:
-                    pass # Ignore error if file doesn't exist
+        # Upload new image to R2
+        try:
+            file_data = image.read()
+            content_type = image.content_type or 'image/jpeg'
+            cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
+            
+            # Delete old image from R2 if it exists
+            if news_item.image_url:
+                old_filename = extract_filename_from_url(news_item.image_url)
+                if old_filename and not news_item.image_url.startswith('http://') and not news_item.image_url.startswith('https://'):
+                    # If it was a local filename, extract it
+                    delete_file_from_cloud(old_filename)
+                elif R2_PUBLIC_URL in news_item.image_url:
+                    # If it's an R2 URL, delete it
+                    delete_file_from_cloud(old_filename)
+            
+            news_item.image_url = cloud_url
+        except Exception as e:
+            return jsonify({"message": f"Failed to upload image: {str(e)}"}), 500
         
-        news_item.image_url = unique_filename
-
     db.session.commit()
     return jsonify({"message": "News updated successfully!", "news": news_item.to_dict()}), 200
 
@@ -275,29 +305,30 @@ def upload_image():
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         unique_filename = f"{timestamp}_{filename}"
         
-        # Save to uploads folder (ensure it exists)
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(upload_path), exist_ok=True)
-        
-        file.save(upload_path)
-        
-        # Add to DB
-        new_image = GalleryImage(filename=unique_filename, caption=request.form.get('caption', ''))
-        db.session.add(new_image)
-        db.session.commit()
-        
-        return jsonify({"message": "Image uploaded successfully"}), 201
+        # Upload to R2 cloud storage
+        try:
+            file_data = file.read()
+            content_type = file.content_type or 'image/jpeg'
+            cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
+            
+            # Add to DB - store full cloud URL in filename field
+            new_image = GalleryImage(filename=cloud_url, caption=request.form.get('caption', ''))
+            db.session.add(new_image)
+            db.session.commit()
+            
+            return jsonify({"message": "Image uploaded successfully"}), 201
+        except Exception as e:
+            return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
 @app.route('/api/gallery/<int:id>', methods=['DELETE'])
 @login_required # ADMIN ONLY
 def delete_image(id):
     image = GalleryImage.query.get_or_404(id)
     
-    # Remove file from disk
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], image.filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    # Remove file from R2 cloud storage
+    filename_to_delete = extract_filename_from_url(image.filename)
+    if filename_to_delete:
+        delete_file_from_cloud(filename_to_delete)
         
     db.session.delete(image)
     db.session.commit()
