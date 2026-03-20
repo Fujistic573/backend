@@ -1,353 +1,617 @@
+import datetime
+import hmac
 import os
 import smtplib
+import time
+from collections import defaultdict, deque
 from email.mime.text import MIMEText
-from flask import Flask, request, jsonify, session, send_from_directory
-from flask_cors import CORS
-from dotenv import load_dotenv
-from database import db, News, ContactMessage, User, GalleryImage
-from cloud_storage import upload_file_to_cloud, delete_file_from_cloud, extract_filename_from_url
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
-import datetime
+from functools import wraps
+from urllib.parse import urlparse
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request, send_from_directory, session
+from flask_cors import CORS
+from werkzeug.security import check_password_hash
+from werkzeug.utils import secure_filename
+
+from cloud_storage import (
+    delete_file_from_cloud,
+    extract_filename_from_url,
+    upload_file_to_cloud,
+)
+from database import ContactMessage, GalleryImage, News, User, db
+
+
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 app = Flask(__name__)
 
-# Database Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chitalishte.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'your_super_secret_key_change_this_later' # For sessions
-app.config['UPLOAD_FOLDER'] = '../uploads' # Folder to store images relative to backend
+DEFAULT_FRONTEND_ORIGINS = {
+    "http://127.0.0.1:5000",
+    "http://localhost:5000",
+    "null",
+}
+ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
+ALLOWED_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+}
+RATE_LIMITS = defaultdict(deque)
 
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_origins():
+    raw_origins = os.getenv("FRONTEND_ORIGINS", "")
+    configured = {
+        origin.strip().rstrip("/")
+        for origin in raw_origins.split(",")
+        if origin.strip()
+    }
+    return sorted(configured | DEFAULT_FRONTEND_ORIGINS)
+
+
+def get_client_ip():
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def is_rate_limited(bucket, limit, window_seconds):
+    key = f"{bucket}:{get_client_ip()}"
+    now = time.time()
+    entries = RATE_LIMITS[key]
+
+    while entries and now - entries[0] > window_seconds:
+        entries.popleft()
+
+    if len(entries) >= limit:
+        return True
+
+    entries.append(now)
+    return False
+
+
+def is_trusted_request_origin():
+    expected = urlparse(request.host_url)
+
+    for header_name in ("Origin", "Referer"):
+        header_value = request.headers.get(header_name)
+        if not header_value:
+            continue
+
+        parsed = urlparse(header_value)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc != expected.netloc:
+            return False
+
+    return True
+
+
+def same_origin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not is_trusted_request_origin():
+            return jsonify({"message": "Untrusted request origin"}), 403
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"message": "Authentication required"}), 401
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
+def get_scraper_api_key():
+    return (os.getenv("SCRAPER_API_KEY") or "").strip()
+
+
+def is_loopback_request():
+    return get_client_ip() in {"127.0.0.1", "::1", "localhost"}
+
+
+def scraper_request_authorized():
+    expected_key = get_scraper_api_key()
+    provided_key = request.headers.get("X-API-Key", "")
+
+    if expected_key:
+        return hmac.compare_digest(provided_key, expected_key)
+
+    # Keep local automation working even if an API key is not configured.
+    return is_loopback_request() and not request.headers.get("Origin")
+
+
+def normalize_text(value, max_length=None):
+    if not isinstance(value, str):
+        return ""
+
+    cleaned = value.strip()
+    if max_length is not None:
+        cleaned = cleaned[:max_length]
+    return cleaned
+
+
+def sanitize_external_url(value):
+    if not value:
+        return None
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    return value
+
+
+def is_allowed_image(filename, content_type):
+    if "." not in filename:
+        return False
+
+    extension = filename.rsplit(".", 1)[1].lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        return False
+
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    return normalized_type in ALLOWED_IMAGE_MIME_TYPES
+
+
+def upload_request_image(file_storage, prefix):
+    if not file_storage or not file_storage.filename:
+        return None
+
+    original_name = secure_filename(file_storage.filename)
+    if not original_name:
+        raise ValueError("Invalid filename")
+
+    content_type = file_storage.mimetype or file_storage.content_type or ""
+    if not is_allowed_image(original_name, content_type):
+        raise ValueError("Only JPG, PNG, GIF, and WEBP images are allowed")
+
+    file_data = file_storage.read()
+    if not file_data:
+        raise ValueError("Uploaded file is empty")
+
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    unique_filename = f"{prefix}_{timestamp}_{original_name}"
+    return upload_file_to_cloud(file_data, unique_filename, content_type)
+
+
+def delete_cloud_image(file_url):
+    filename = extract_filename_from_url(file_url)
+    if filename:
+        delete_file_from_cloud(filename)
+
+
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///chitalishte.db",
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = (
+    os.getenv("SECRET_KEY")
+    or os.getenv("FLASK_SECRET_KEY")
+    or os.urandom(32).hex()
+)
+app.config["UPLOAD_FOLDER"] = os.path.abspath(os.path.join(BASE_DIR, "..", "uploads"))
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.getenv("MAX_CONTENT_LENGTH", str(8 * 1024 * 1024))
+)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+app.config["SESSION_COOKIE_SECURE"] = parse_bool(
+    os.getenv("SESSION_COOKIE_SECURE"),
+    default=False,
+)
 
 db.init_app(app)
 
-# Allow your frontend origins explicitly
-# Allow all origins for development to avoid issues with file:// or different ports
-CORS(app, supports_credentials=True)
+CORS(
+    app,
+    supports_credentials=True,
+    resources={
+        r"/api/*": {"origins": parse_origins()},
+        r"/send-email": {"origins": parse_origins()},
+        r"/admin.*": {"origins": parse_origins()},
+    },
+)
 
-# Create tables
 with app.app_context():
     db.create_all()
 
-# --- EMAIL CONFIGURATION ---
-EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS')
-EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD')
-RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL', EMAIL_ADDRESS)
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", EMAIL_ADDRESS)
+ADMIN_DIR = os.path.join(BASE_DIR, "..", "admin")
 
-# Проверка дали основните данни са зададени
+if not os.getenv("SECRET_KEY") and not os.getenv("FLASK_SECRET_KEY"):
+    print("WARNING: SECRET_KEY is not set. A temporary key was generated for this run.")
+
 if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-    print("ГРЕШКА: Данните за имейл (EMAIL_ADDRESS, EMAIL_PASSWORD) не са зададени като променливи на средата.")
+    print("WARNING: EMAIL_ADDRESS or EMAIL_PASSWORD is not configured.")
 
-@app.route('/send-email', methods=['POST'])
+
+@app.errorhandler(413)
+def file_too_large(_error):
+    return jsonify({"message": "File is too large"}), 413
+
+
+@app.route("/send-email", methods=["POST"])
 def send_email():
-    try:
-        # Вземи данните от формата
-        name = request.form['name']
-        visitor_email = request.form['email']
-        message_content = request.form['message']
+    if is_rate_limited("contact-form", limit=5, window_seconds=15 * 60):
+        return jsonify({"status": "error", "message": "Too many requests. Try again later."}), 429
 
-        # Save to Database
-        new_message = ContactMessage(name=name, email=visitor_email, message=message_content)
-        db.session.add(new_message)
-        db.session.commit()
+    name = normalize_text(request.form.get("name"), max_length=100)
+    visitor_email = normalize_text(request.form.get("email"), max_length=120)
+    message_content = normalize_text(request.form.get("message"))
 
-        if not RECIPIENT_EMAIL:
-             return jsonify({
+    if not name or not visitor_email or not message_content:
+        return jsonify({"status": "error", "message": "All fields are required."}), 400
+
+    if "@" not in visitor_email or "." not in visitor_email.split("@")[-1]:
+        return jsonify({"status": "error", "message": "Invalid email address."}), 400
+
+    new_message = ContactMessage(name=name, email=visitor_email, message=message_content)
+    db.session.add(new_message)
+    db.session.commit()
+
+    if not RECIPIENT_EMAIL:
+        return jsonify(
+            {
                 "status": "success",
-                "message": "Съобщението е запазено в базата данни (Имейл не е конфигуриран)."
-            })
+                "message": "Message saved successfully.",
+            }
+        )
 
-        # Създай съдържанието на имейла
-        subject = f"Ново съобщение от сайта от {name}"
-        body = f"""
-        Име: {name}
-        Имейл: {visitor_email}
-        
-        Съобщение:
-        {message_content}
-        """
+    subject = f"New website message from {name}"
+    body = f"Name: {name}\nEmail: {visitor_email}\n\nMessage:\n{message_content}"
 
-        msg = MIMEText(body, 'plain', 'utf-8')
-        msg['Subject'] = subject
-        msg['From'] = f"Сайт на с. Яворово <{EMAIL_ADDRESS}>"
-        msg['To'] = RECIPIENT_EMAIL
-        msg['Reply-To'] = visitor_email
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = f"Website Contact <{EMAIL_ADDRESS}>"
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Reply-To"] = visitor_email
 
-        # Изпрати имейла
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp_server:
             smtp_server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             smtp_server.sendmail(EMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
+    except Exception as exc:
+        print(f"Email send failed: {exc}")
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Message was saved, but the email could not be sent.",
+            }
+        ), 502
 
-        return jsonify({
-            "status": "success",
-            "message": "Съобщението е изпратено успешно и запазено!"
-        })
+    return jsonify({"status": "success", "message": "Message sent successfully."})
 
-    except Exception as e:
-        print(f"Възникна грешка: {e}")
-        return jsonify({
-            "status": "error",
-            "message": "Възникна грешка при изпращането на съобщението."
-        }), 500
 
-# --- NEWS ROUTES ---
-# --- AUTH ROUTES ---
-@app.route('/api/login', methods=['POST'])
+@app.route("/api/login", methods=["POST"])
+@same_origin_required
 def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
+    if is_rate_limited("login", limit=10, window_seconds=15 * 60):
+        return jsonify({"message": "Too many login attempts", "status": "error"}), 429
+
+    data = request.get_json(silent=True) or {}
+    username = normalize_text(data.get("username"), max_length=80)
+    password = data.get("password") or ""
+
+    if not username or not password:
+        return jsonify({"message": "Username and password are required", "status": "error"}), 400
 
     user = User.query.filter_by(username=username).first()
 
     if user and check_password_hash(user.password_hash, password):
-        session['user_id'] = user.id
+        session.clear()
+        session["user_id"] = user.id
         return jsonify({"message": "Logged in successfully", "status": "success"}), 200
-    
+
     return jsonify({"message": "Invalid credentials", "status": "error"}), 401
 
-@app.route('/api/logout', methods=['POST'])
+
+@app.route("/api/logout", methods=["POST"])
+@same_origin_required
 def logout():
-    session.pop('user_id', None)
+    session.clear()
     return jsonify({"message": "Logged out"}), 200
 
-@app.route('/api/check-auth', methods=['GET'])
+
+@app.route("/api/check-auth", methods=["GET"])
 def check_auth():
-    if 'user_id' in session:
-        return jsonify({"authenticated": True}), 200
-    return jsonify({"authenticated": False}), 200
+    return jsonify({"authenticated": "user_id" in session}), 200
 
-# --- Helper for protecting routes ---
-def login_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return jsonify({"message": "Authentication required"}), 401
-        return f(*args, **kwargs)
-    return decorated_function
 
-# --- NEWS ROUTES ---
-@app.route('/api/news', methods=['GET'])
+@app.route("/api/news", methods=["GET"])
 def get_news():
-    # Get query parameters
-    page = request.args.get('page', 1, type=int)
-    limit = request.args.get('limit', 10, type=int)
-    search = request.args.get('search', '', type=str)
-    
-    # Build query
+    page = max(request.args.get("page", 1, type=int), 1)
+    limit = request.args.get("limit", 10, type=int)
+    limit = min(max(limit, 1), 50)
+    search = request.args.get("search", "", type=str).strip()
+
     query = News.query
-    
-    # Apply search filter if provided
+
     if search:
         search_filter = f"%{search}%"
         query = query.filter((News.title.like(search_filter)) | (News.content.like(search_filter)))
-    
-    # Order and get total
+
     query = query.order_by(News.date_posted.desc())
     total = query.count()
-    
-    # Apply pagination
     news_items = query.offset((page - 1) * limit).limit(limit).all()
-    
-    return jsonify({
-        'news': [news.to_dict() for news in news_items],
-        'total': total,
-        'page': page,
-        'limit': limit,
-        'pages': (total + limit - 1) // limit
-    })
 
-# Get single news by ID
-@app.route('/api/news/<int:news_id>', methods=['GET'])
+    return jsonify(
+        {
+            "news": [news.to_dict() for news in news_items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": (total + limit - 1) // limit if total else 0,
+        }
+    )
+
+
+@app.route("/api/news/<int:news_id>", methods=["GET"])
 def get_single_news(news_id):
     news = News.query.get(news_id)
     if not news:
-        return jsonify({'error': 'News not found'}), 404
+        return jsonify({"error": "News not found"}), 404
     return jsonify(news.to_dict())
 
-@app.route('/api/news', methods=['POST'])
-@app.route('/api/news', methods=['POST'])
+
+@app.route("/api/news", methods=["POST"])
 def add_news():
-    # 1. Handle JSON (Scraper)
     if request.is_json:
-        data = request.get_json()
-        
-        # --- DUPLICATE PREVENTION (Scraper Logic) ---
-        if data.get('source_link') and "profile.php?id=" not in data['source_link']:
-            existing_link = News.query.filter_by(source_link=data['source_link']).first()
+        if not scraper_request_authorized():
+            return jsonify({"message": "Scraper authentication required"}), 401
+
+        data = request.get_json(silent=True) or {}
+        title = normalize_text(data.get("title"), max_length=200)
+        content = normalize_text(data.get("content"))
+        image_url = sanitize_external_url(data.get("image_url"))
+        source_link = sanitize_external_url(data.get("source_link"))
+
+        if not title or not content:
+            return jsonify({"message": "Title and content are required"}), 400
+
+        if source_link and "profile.php?id=" not in source_link:
+            existing_link = News.query.filter_by(source_link=source_link).first()
             if existing_link:
                 return jsonify({"message": "News already exists (link match)"}), 200
 
-        if data.get('image_url'):
-            existing_image = News.query.filter_by(image_url=data['image_url']).first()
+        if image_url:
+            existing_image = News.query.filter_by(image_url=image_url).first()
             if existing_image:
-                 return jsonify({"message": "News already exists (image match)"}), 200
+                return jsonify({"message": "News already exists (image match)"}), 200
 
-        existing_title = News.query.filter_by(title=data['title']).first()
+        existing_title = News.query.filter_by(title=title).first()
         if existing_title:
             return jsonify({"message": "News already exists (title match)"}), 200
-        
-        new_news = News(
-            title=data['title'],
-            content=data['content'],
-            image_url=data.get('image_url'),
-            source_link=data.get('source_link')
-        )
-        db.session.add(new_news)
-        db.session.commit()
-        return jsonify({"message": "News added successfully (Scraper)!"}), 201
 
-    # 2. Handle Multipart/FormData (Admin Panel Manual Add)
-    else:
-        # Auth Check for manual add
-        if 'user_id' not in session:
-             return jsonify({"message": "Authentication required"}), 401
-             
-        title = request.form.get('title')
-        content = request.form.get('content')
-        file = request.files.get('image')
-        
-        if not title or not content:
-             return jsonify({"message": "Title and Content are required"}), 400
-
-        image_path = None
-        if file and file.filename != '':
-            filename = secure_filename(file.filename)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-            unique_filename = f"news_{timestamp}_{filename}"
-            
-            # Upload to R2 cloud storage instead of local folder
-            try:
-                file_data = file.read()
-                content_type = file.content_type or 'image/jpeg'
-                cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
-                image_path = cloud_url  # Store full cloud URL
-            except Exception as e:
-                return jsonify({"message": f"Failed to upload image: {str(e)}"}), 500
-            
         new_news = News(
             title=title,
             content=content,
-            image_url=image_path, # In frontend we will check if it starts with http
-            source_link=None # Manual news usually has no external link
+            image_url=image_url,
+            source_link=source_link,
         )
         db.session.add(new_news)
         db.session.commit()
-        return jsonify({"message": "News added successfully!"}), 201
+        return jsonify({"message": "News added successfully (scraper)!"}), 201
+
+    if "user_id" not in session:
+        return jsonify({"message": "Authentication required"}), 401
+
+    if not is_trusted_request_origin():
+        return jsonify({"message": "Untrusted request origin"}), 403
+
+    title = normalize_text(request.form.get("title"), max_length=200)
+    content = normalize_text(request.form.get("content"))
+    file_storage = request.files.get("image")
+
+    if not title or not content:
+        return jsonify({"message": "Title and content are required"}), 400
+
+    image_path = None
+    if file_storage and file_storage.filename:
+        try:
+            image_path = upload_request_image(file_storage, prefix="news")
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"message": f"Failed to upload image: {exc}"}), 500
+
+    new_news = News(
+        title=title,
+        content=content,
+        image_url=image_path,
+        source_link=None,
+    )
+    db.session.add(new_news)
+    db.session.commit()
+    return jsonify({"message": "News added successfully!"}), 201
 
 
-@app.route('/api/news/<int:id>', methods=['PUT'])
-@login_required # ONLY ADMIN CAN EDIT
-def update_news(id):
-    news_item = News.query.get_or_404(id)
-    
-    title = request.form.get('title')
-    content = request.form.get('content')
-    image = request.files.get('image')
+@app.route("/api/news/<int:news_id>", methods=["PUT"])
+@login_required
+@same_origin_required
+def update_news(news_id):
+    news_item = News.query.get_or_404(news_id)
+
+    title = normalize_text(request.form.get("title"), max_length=200)
+    content = normalize_text(request.form.get("content"))
+    image = request.files.get("image")
 
     if title:
         news_item.title = title
     if content:
         news_item.content = content
-        
-    if image and image.filename != '':
-        # Generate unique filename for new image
-        filename = secure_filename(image.filename)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        unique_filename = f"news_{timestamp}_{filename}"
-        
-        # Upload new image to R2
+
+    if image and image.filename:
         try:
-            file_data = image.read()
-            content_type = image.content_type or 'image/jpeg'
-            cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
-            
-            # Delete old image from R2 if it exists
-            if news_item.image_url:
-                old_filename = extract_filename_from_url(news_item.image_url)
-                if old_filename and not news_item.image_url.startswith('http://') and not news_item.image_url.startswith('https://'):
-                    # If it was a local filename, extract it
-                    delete_file_from_cloud(old_filename)
-                elif R2_PUBLIC_URL in news_item.image_url:
-                    # If it's an R2 URL, delete it
-                    delete_file_from_cloud(old_filename)
-            
-            news_item.image_url = cloud_url
-        except Exception as e:
-            return jsonify({"message": f"Failed to upload image: {str(e)}"}), 500
-        
+            cloud_url = upload_request_image(image, prefix="news")
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"message": f"Failed to upload image: {exc}"}), 500
+
+        delete_cloud_image(news_item.image_url)
+        news_item.image_url = cloud_url
+
     db.session.commit()
     return jsonify({"message": "News updated successfully!", "news": news_item.to_dict()}), 200
 
-@app.route('/api/news/<int:id>', methods=['DELETE'])
-@login_required # ONLY ADMIN CAN DELETE
-def delete_news(id):
-    news_item = News.query.get_or_404(id)
+
+@app.route("/api/news/<int:news_id>", methods=["DELETE"])
+@login_required
+@same_origin_required
+def delete_news(news_id):
+    news_item = News.query.get_or_404(news_id)
+    delete_cloud_image(news_item.image_url)
     db.session.delete(news_item)
     db.session.commit()
     return jsonify({"message": "News deleted"}), 200
 
 
-# --- GALLERY ROUTES ---
-@app.route('/api/gallery', methods=['GET'])
+@app.route("/api/gallery", methods=["GET"])
 def get_gallery():
     images = GalleryImage.query.order_by(GalleryImage.date_uploaded.desc()).all()
     return jsonify([img.to_dict() for img in images])
 
-@app.route('/api/gallery', methods=['POST'])
-@login_required # ADMIN ONLY
-def upload_image():
-    if 'image' not in request.files:
-        return jsonify({"message": "No image part"}), 400
-    
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({"message": "No selected file"}), 400
-    
-    if file:
-        filename = secure_filename(file.filename)
-        # Ensure unique filename to prevent overwrites
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        unique_filename = f"{timestamp}_{filename}"
-        
-        # Upload to R2 cloud storage
-        try:
-            file_data = file.read()
-            content_type = file.content_type or 'image/jpeg'
-            cloud_url = upload_file_to_cloud(file_data, unique_filename, content_type)
-            
-            # Add to DB - store full cloud URL in filename field
-            new_image = GalleryImage(filename=cloud_url, caption=request.form.get('caption', ''))
-            db.session.add(new_image)
-            db.session.commit()
-            
-            return jsonify({"message": "Image uploaded successfully"}), 201
-        except Exception as e:
-            return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
-@app.route('/api/gallery/<int:id>', methods=['DELETE'])
-@login_required # ADMIN ONLY
-def delete_image(id):
-    image = GalleryImage.query.get_or_404(id)
-    
-    # Remove file from R2 cloud storage
-    filename_to_delete = extract_filename_from_url(image.filename)
-    if filename_to_delete:
-        delete_file_from_cloud(filename_to_delete)
-        
+@app.route("/api/gallery", methods=["POST"])
+@login_required
+@same_origin_required
+def upload_image():
+    file_storage = request.files.get("image")
+    if not file_storage:
+        return jsonify({"message": "No image part"}), 400
+    if not file_storage.filename:
+        return jsonify({"message": "No selected file"}), 400
+
+    try:
+        cloud_url = upload_request_image(file_storage, prefix="gallery")
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"message": f"Upload failed: {exc}"}), 500
+
+    caption = normalize_text(request.form.get("caption"), max_length=255)
+    new_image = GalleryImage(filename=cloud_url, caption=caption)
+    db.session.add(new_image)
+    db.session.commit()
+
+    return jsonify({"message": "Image uploaded successfully"}), 201
+
+
+@app.route("/api/gallery/<int:image_id>", methods=["DELETE"])
+@login_required
+@same_origin_required
+def delete_image(image_id):
+    image = GalleryImage.query.get_or_404(image_id)
+    delete_cloud_image(image.filename)
     db.session.delete(image)
     db.session.commit()
     return jsonify({"message": "Image deleted"}), 200
 
-# Serve uploaded files
-@app.route('/uploads/<filename>')
-def serve_uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-if __name__ == '__main__':
+@app.route("/uploads/<path:filename>")
+def serve_uploaded_file(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+
+@app.route("/admin")
+@app.route("/admin/")
+@app.route("/admin/index.html")
+def serve_admin():
+    if "user_id" not in session:
+        return """<!DOCTYPE html>
+<html lang="bg">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Login</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .login-box { background: #16213e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); width: 380px; }
+        .login-box h2 { color: #e94560; text-align: center; margin-bottom: 30px; }
+        .login-box input { width: 100%; padding: 12px 16px; margin-bottom: 16px; border: 1px solid #0f3460; border-radius: 8px; background: #0f3460; color: white; font-size: 14px; }
+        .login-box input::placeholder { color: #888; }
+        .login-box button { width: 100%; padding: 12px; background: #e94560; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer; }
+        .login-box button:hover { background: #c73652; }
+        #error { color: #e94560; text-align: center; margin-top: 10px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h2>Admin Panel</h2>
+        <input type="text" id="username" placeholder="Username" autofocus>
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="doLogin()">Login</button>
+        <p id="error"></p>
+    </div>
+    <script>
+        document.getElementById('password').addEventListener('keypress', function (event) {
+            if (event.key === 'Enter') {
+                doLogin();
+            }
+        });
+
+        function doLogin() {
+            fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({
+                    username: document.getElementById('username').value,
+                    password: document.getElementById('password').value
+                })
+            })
+            .then(function (response) { return response.json(); })
+            .then(function (data) {
+                if (data.status === 'success') {
+                    window.location.reload();
+                } else {
+                    document.getElementById('error').innerText = data.message;
+                }
+            })
+            .catch(function () {
+                document.getElementById('error').innerText = 'Connection error';
+            });
+        }
+    </script>
+</body>
+</html>""", 200
+
+    return send_from_directory(ADMIN_DIR, "index.html")
+
+
+@app.route("/admin/<path:filename>")
+def serve_admin_assets(filename):
+    if filename in {"", "index.html"}:
+        return serve_admin()
+    if "user_id" not in session:
+        return jsonify({"message": "Authentication required"}), 401
+    return send_from_directory(ADMIN_DIR, filename)
+
+
+if __name__ == "__main__":
     with app.app_context():
-        db.create_all() # Ensure tables exist
-    app.run(debug=True)
+        db.create_all()
+
+    app.run(debug=parse_bool(os.getenv("FLASK_DEBUG"), default=False))

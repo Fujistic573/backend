@@ -2,6 +2,8 @@
 Cloud Storage Helper - Handles file uploads/deletes to Cloudflare R2
 """
 import os
+from urllib.parse import urlparse
+
 import boto3
 from botocore.client import Config
 from dotenv import load_dotenv
@@ -84,6 +86,15 @@ def extract_filename_from_url(url):
     Returns:
         str: Just the filename 'image.jpg'
     """
-    if url and R2_PUBLIC_URL in url:
+    if not url:
+        return None
+
+    normalized_public_url = (R2_PUBLIC_URL or '').rstrip('/')
+    if normalized_public_url and url.startswith(f"{normalized_public_url}/"):
         return url.split('/')[-1]
+
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        return None
+
     return url
