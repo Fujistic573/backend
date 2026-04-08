@@ -1,6 +1,8 @@
 import datetime
 import hmac
+import html as html_mod
 import os
+import secrets
 import smtplib
 import time
 from collections import defaultdict, deque
@@ -19,7 +21,7 @@ from cloud_storage import (
     extract_filename_from_url,
     upload_file_to_cloud,
 )
-from database import ContactMessage, GalleryImage, News, User, db
+from database import ContactMessage, GalleryImage, News, Newspaper, User, Event, db
 
 
 BASE_DIR = os.path.dirname(__file__)
@@ -27,18 +29,34 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 app = Flask(__name__)
 
-DEFAULT_FRONTEND_ORIGINS = {
-    "http://127.0.0.1:5000",
-    "http://localhost:5000",
-    "null",
+ALLOWED_IMAGE_EXTENSIONS_BY_TYPE = {
+    "jpeg": {"jpg", "jpeg"},
+    "png": {"png"},
+    "gif": {"gif"},
+    "webp": {"webp"},
+    "bmp": {"bmp"},
+    "tiff": {"tif", "tiff"},
+    "avif": {"avif"},
 }
-ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
-ALLOWED_IMAGE_MIME_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
+IMAGE_MIME_TYPES_BY_TYPE = {
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+    "tiff": "image/tiff",
+    "avif": "image/avif",
 }
+IMAGE_EXTENSION_BY_TYPE = {
+    "jpeg": "jpg",
+    "png": "png",
+    "gif": "gif",
+    "webp": "webp",
+    "bmp": "bmp",
+    "tiff": "tiff",
+    "avif": "avif",
+}
+ALLOWED_PDF_EXTENSIONS = {"pdf"}
 RATE_LIMITS = defaultdict(deque)
 
 
@@ -48,6 +66,32 @@ def parse_bool(value, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+TRUST_PROXY_HEADERS = parse_bool(os.getenv("TRUST_PROXY_HEADERS"), default=False)
+ALLOW_DEV_ORIGINS = parse_bool(
+    os.getenv("ALLOW_DEV_ORIGINS"),
+    default=parse_bool(os.getenv("FLASK_DEBUG"), default=False),
+)
+ALLOW_UNAUTHENTICATED_LOOPBACK_SCRAPER = parse_bool(
+    os.getenv("ALLOW_UNAUTHENTICATED_LOOPBACK_SCRAPER"),
+    default=False,
+)
+
+
+def default_frontend_origins():
+    if not ALLOW_DEV_ORIGINS:
+        return set()
+
+    origins = {"null"}
+    local_hosts = ("127.0.0.1", "localhost")
+    local_ports = ("5000", "5500", "5501", "5502", "3000", "4173", "5173", "8080")
+
+    for host in local_hosts:
+        for port in local_ports:
+            origins.add(f"http://{host}:{port}")
+
+    return origins
+
+
 def parse_origins():
     raw_origins = os.getenv("FRONTEND_ORIGINS", "")
     configured = {
@@ -55,13 +99,35 @@ def parse_origins():
         for origin in raw_origins.split(",")
         if origin.strip()
     }
-    return sorted(configured | DEFAULT_FRONTEND_ORIGINS)
+    return sorted(configured | default_frontend_origins())
 
+# Custom CORS implementation to bypass flask_cors issues
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    print(f"--- AFTER REQUEST FIRED: origin={origin} path={request.path}")
+    if origin:
+        print(f"--- ADDING CORS HEADERS FOR: {origin}")
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-API-Key"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return response
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def api_options(path):
+    return "", 200
 
 def get_client_ip():
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+    if TRUST_PROXY_HEADERS:
+        forwarded_for = request.headers.get("X-Forwarded-For", "")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
+
     return request.remote_addr or "unknown"
 
 
@@ -82,10 +148,15 @@ def is_rate_limited(bucket, limit, window_seconds):
 
 def is_trusted_request_origin():
     expected = urlparse(request.host_url)
+    allowed_origins = set(parse_origins())
 
     for header_name in ("Origin", "Referer"):
         header_value = request.headers.get(header_name)
         if not header_value:
+            continue
+
+        raw_header = header_value.rstrip("/")
+        if raw_header in allowed_origins:
             continue
 
         parsed = urlparse(header_value)
@@ -130,7 +201,9 @@ def scraper_request_authorized():
     if expected_key:
         return hmac.compare_digest(provided_key, expected_key)
 
-    # Keep local automation working even if an API key is not configured.
+    if not ALLOW_UNAUTHENTICATED_LOOPBACK_SCRAPER:
+        return False
+
     return is_loopback_request() and not request.headers.get("Origin")
 
 
@@ -159,16 +232,24 @@ def sanitize_external_url(value):
     return value
 
 
-def is_allowed_image(filename, content_type):
-    if "." not in filename:
-        return False
-
-    extension = filename.rsplit(".", 1)[1].lower()
-    if extension not in ALLOWED_IMAGE_EXTENSIONS:
-        return False
-
-    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
-    return normalized_type in ALLOWED_IMAGE_MIME_TYPES
+def detect_image_type(file_data):
+    if file_data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if file_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if file_data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if len(file_data) >= 12 and file_data.startswith(b"RIFF") and file_data[8:12] == b"WEBP":
+        return "webp"
+    if file_data.startswith(b"BM"):
+        return "bmp"
+    if file_data.startswith((b"II\x2a\x00", b"MM\x00\x2a")):
+        return "tiff"
+    if len(file_data) >= 12:
+        # AVIF is an ISOBMFF container with 'ftypavif' or 'ftypavis'
+        if b"ftypavif" in file_data[:32] or b"ftypavis" in file_data[:32]:
+            return "avif"
+    return None
 
 
 def upload_request_image(file_storage, prefix):
@@ -179,17 +260,53 @@ def upload_request_image(file_storage, prefix):
     if not original_name:
         raise ValueError("Invalid filename")
 
-    content_type = file_storage.mimetype or file_storage.content_type or ""
-    if not is_allowed_image(original_name, content_type):
-        raise ValueError("Only JPG, PNG, GIF, and WEBP images are allowed")
+    file_data = file_storage.read()
+    if not file_data:
+        raise ValueError("Uploaded file is empty")
+
+    if "." not in original_name:
+        raise ValueError("Missing file extension")
+
+    detected_image_type = detect_image_type(file_data)
+    if not detected_image_type:
+        raise ValueError("Uploaded file is not a valid JPG, PNG, GIF, or WEBP image")
+
+    original_extension = original_name.rsplit(".", 1)[1].lower()
+    allowed_extensions = ALLOWED_IMAGE_EXTENSIONS_BY_TYPE[detected_image_type]
+    if original_extension not in allowed_extensions:
+        raise ValueError("File extension does not match image content")
+
+    content_type = IMAGE_MIME_TYPES_BY_TYPE[detected_image_type]
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    random_suffix = secrets.token_hex(8)
+    canonical_extension = IMAGE_EXTENSION_BY_TYPE[detected_image_type]
+    unique_filename = f"{prefix}_{timestamp}_{random_suffix}.{canonical_extension}"
+    return upload_file_to_cloud(file_data, unique_filename, content_type)
+
+
+def upload_request_pdf(file_storage, prefix):
+    if not file_storage or not file_storage.filename:
+        return None
+
+    original_name = secure_filename(file_storage.filename)
+    if not original_name:
+        raise ValueError("Invalid filename")
 
     file_data = file_storage.read()
     if not file_data:
         raise ValueError("Uploaded file is empty")
 
+    if "." not in original_name:
+        raise ValueError("Missing file extension")
+
+    extension = original_name.rsplit(".", 1)[1].lower()
+    if extension not in ALLOWED_PDF_EXTENSIONS:
+        raise ValueError("Only PDF files are allowed")
+
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    unique_filename = f"{prefix}_{timestamp}_{original_name}"
-    return upload_file_to_cloud(file_data, unique_filename, content_type)
+    random_suffix = secrets.token_hex(8)
+    unique_filename = f"{prefix}_{timestamp}_{random_suffix}.pdf"
+    return upload_file_to_cloud(file_data, unique_filename, "application/pdf")
 
 
 def delete_cloud_image(file_url):
@@ -210,10 +327,12 @@ app.config["SECRET_KEY"] = (
 )
 app.config["UPLOAD_FOLDER"] = os.path.abspath(os.path.join(BASE_DIR, "..", "uploads"))
 app.config["MAX_CONTENT_LENGTH"] = int(
-    os.getenv("MAX_CONTENT_LENGTH", str(8 * 1024 * 1024))
+    os.getenv("MAX_CONTENT_LENGTH", str(100 * 1024 * 1024))
 )
 app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+app.config["SESSION_COOKIE_SAMESITE"] = os.getenv(
+    "SESSION_COOKIE_SAMESITE", "Lax"
+)
 app.config["SESSION_COOKIE_SECURE"] = parse_bool(
     os.getenv("SESSION_COOKIE_SECURE"),
     default=False,
@@ -221,15 +340,8 @@ app.config["SESSION_COOKIE_SECURE"] = parse_bool(
 
 db.init_app(app)
 
-CORS(
-    app,
-    supports_credentials=True,
-    resources={
-        r"/api/*": {"origins": parse_origins()},
-        r"/send-email": {"origins": parse_origins()},
-        r"/admin.*": {"origins": parse_origins()},
-    },
-)
+allowed_origins = parse_origins()
+# Removed conflicting CORS definition
 
 with app.app_context():
     db.create_all()
@@ -251,7 +363,35 @@ def file_too_large(_error):
     return jsonify({"message": "File is too large"}), 413
 
 
+@app.after_request
+def apply_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=()",
+    )
+
+    if request.is_secure:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+
+    if request.path.startswith("/admin") or request.path in {
+        "/api/login",
+        "/api/logout",
+        "/api/check-auth",
+    }:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+
+    return response
+
+
 @app.route("/send-email", methods=["POST"])
+@same_origin_required
 def send_email():
     if is_rate_limited("contact-form", limit=5, window_seconds=15 * 60):
         return jsonify({"status": "error", "message": "Too many requests. Try again later."}), 429
@@ -278,10 +418,80 @@ def send_email():
             }
         )
 
-    subject = f"New website message from {name}"
-    body = f"Name: {name}\nEmail: {visitor_email}\n\nMessage:\n{message_content}"
+    subject = f"Ново съобщение от сайта: {name}"
 
-    msg = MIMEText(body, "plain", "utf-8")
+    # Escape HTML entities in user input
+    safe_name = html_mod.escape(name)
+    safe_email = html_mod.escape(visitor_email)
+    safe_message = html_mod.escape(message_content).replace("\n", "<br>")
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background-color:#FBF9F3; font-family: 'Segoe UI', Tahoma, sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#FBF9F3; padding:30px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background: linear-gradient(135deg, #A4242F, #821c25); padding:30px 40px; text-align:center;">
+            <h1 style="color:#ffffff; margin:0; font-size:22px; font-weight:700; letter-spacing:0.5px;">
+              &#128232; Ново съобщение от сайта
+            </h1>
+            <p style="color:rgba(255,255,255,0.8); margin:8px 0 0; font-size:14px;">
+              НЧ "Пробуда" 1925г. — Контактна форма
+            </p>
+          </td>
+        </tr>
+
+        <!-- Sender Info -->
+        <tr>
+          <td style="padding:30px 40px 15px;">
+            <table width="100%" style="background:#f8f5f0; border-radius:8px; padding:20px; border-left:4px solid #D4A373;">
+              <tr>
+                <td style="padding:5px 0;">
+                  <span style="color:#888; font-size:12px; text-transform:uppercase; letter-spacing:1px;">Изпратено от</span><br>
+                  <strong style="color:#3D352E; font-size:16px;">{safe_name}</strong>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:5px 0;">
+                  <span style="color:#888; font-size:12px; text-transform:uppercase; letter-spacing:1px;">Имейл адрес</span><br>
+                  <a href="mailto:{safe_email}" style="color:#A4242F; font-size:15px; text-decoration:none; font-weight:600;">{safe_email}</a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Message Body -->
+        <tr>
+          <td style="padding:15px 40px 30px;">
+            <p style="color:#888; font-size:12px; text-transform:uppercase; letter-spacing:1px; margin:0 0 10px;">Съобщение</p>
+            <div style="background:#fdfcfa; border:1px solid #e0dcd1; border-radius:8px; padding:20px; color:#3D352E; font-size:15px; line-height:1.7;">
+              {safe_message}
+            </div>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8f5f0; padding:20px 40px; text-align:center; border-top:1px solid #e0dcd1;">
+            <p style="color:#999; font-size:12px; margin:0;">
+              Това съобщение е изпратено автоматично от контактната форма на сайта.<br>
+              © {datetime.datetime.now().year} НЧ "Пробуда" 1925г., с. Яворово
+            </p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = f"Website Contact <{EMAIL_ADDRESS}>"
     msg["To"] = RECIPIENT_EMAIL
@@ -291,6 +501,27 @@ def send_email():
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp_server:
             smtp_server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             smtp_server.sendmail(EMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
+
+            # Send a simple plain-text confirmation to the visitor
+            confirm_body = (
+                f"Здравейте, {name}!\n\n"
+                "Благодарим Ви, че се свързахте с нас.\n"
+                "Вашето съобщение беше получено успешно и ще се постараем "
+                "да отговорим възможно най-скоро.\n\n"
+                "С уважение,\n"
+                "НЧ \"Пробуда\" 1925г.\n"
+                "с. Яворово\n"
+            )
+            confirm_msg = MIMEText(confirm_body, "plain", "utf-8")
+            confirm_msg["Subject"] = "Вашето съобщение беше получено — НЧ \"Пробуда\" 1925г."
+            confirm_msg["From"] = f"НЧ Пробуда 1925г. <{EMAIL_ADDRESS}>"
+            confirm_msg["To"] = visitor_email
+
+            try:
+                smtp_server.sendmail(EMAIL_ADDRESS, visitor_email, confirm_msg.as_string())
+            except Exception:
+                pass  # Don't fail the whole request if confirmation fails
+
     except Exception as exc:
         print(f"Email send failed: {exc}")
         return jsonify(
@@ -306,7 +537,7 @@ def send_email():
 @app.route("/api/login", methods=["POST"])
 @same_origin_required
 def login():
-    if is_rate_limited("login", limit=10, window_seconds=15 * 60):
+    if is_rate_limited("login", limit=100, window_seconds=15 * 60):
         return jsonify({"message": "Too many login attempts", "status": "error"}), 429
 
     data = request.get_json(silent=True) or {}
@@ -334,6 +565,7 @@ def logout():
 
 
 @app.route("/api/check-auth", methods=["GET"])
+@same_origin_required
 def check_auth():
     return jsonify({"authenticated": "user_id" in session}), 200
 
@@ -421,24 +653,29 @@ def add_news():
 
     title = normalize_text(request.form.get("title"), max_length=200)
     content = normalize_text(request.form.get("content"))
-    file_storage = request.files.get("image")
+    files = request.files.getlist("image")
 
     if not title or not content:
         return jsonify({"message": "Title and content are required"}), 400
 
-    image_path = None
-    if file_storage and file_storage.filename:
-        try:
-            image_path = upload_request_image(file_storage, prefix="news")
-        except ValueError as exc:
-            return jsonify({"message": str(exc)}), 400
-        except Exception as exc:
-            return jsonify({"message": f"Failed to upload image: {exc}"}), 500
+    image_paths = []
+    if files:
+        for file_storage in files:
+            if file_storage and file_storage.filename:
+                try:
+                    cloud_url = upload_request_image(file_storage, prefix="news")
+                    image_paths.append(cloud_url)
+                except ValueError as exc:
+                    return jsonify({"message": f"{file_storage.filename}: {exc}"}), 400
+                except Exception as exc:
+                    return jsonify({"message": f"Failed to upload {file_storage.filename}: {exc}"}), 500
+
+    final_image_url = ",".join(image_paths) if image_paths else None
 
     new_news = News(
         title=title,
         content=content,
-        image_url=image_path,
+        image_url=final_image_url,
         source_link=None,
     )
     db.session.add(new_news)
@@ -454,26 +691,35 @@ def update_news(news_id):
 
     title = normalize_text(request.form.get("title"), max_length=200)
     content = normalize_text(request.form.get("content"))
-    image = request.files.get("image")
+    images = request.files.getlist("image")
 
     if title:
         news_item.title = title
     if content:
         news_item.content = content
 
-    if image and image.filename:
-        try:
-            cloud_url = upload_request_image(image, prefix="news")
-        except ValueError as exc:
-            return jsonify({"message": str(exc)}), 400
-        except Exception as exc:
-            return jsonify({"message": f"Failed to upload image: {exc}"}), 500
-
-        delete_cloud_image(news_item.image_url)
-        news_item.image_url = cloud_url
+    if images and any(img.filename for img in images):
+        image_paths = []
+        for file_storage in images:
+            if file_storage and file_storage.filename:
+                try:
+                    cloud_url = upload_request_image(file_storage, prefix="news")
+                    image_paths.append(cloud_url)
+                except ValueError as exc:
+                    return jsonify({"message": f"{file_storage.filename}: {exc}"}), 400
+                except Exception as exc:
+                    return jsonify({"message": f"Failed to upload {file_storage.filename}: {exc}"}), 500
+        
+        # Delete old images if they exist
+        if news_item.image_url:
+            for old_img in news_item.image_url.split(","):
+                delete_cloud_image(old_img.strip())
+                
+        # We replace the entire old image string
+        news_item.image_url = ",".join(image_paths)
 
     db.session.commit()
-    return jsonify({"message": "News updated successfully!", "news": news_item.to_dict()}), 200
+    return jsonify({"message": "News updated successfully", "news": news_item.to_dict()}), 200
 
 
 @app.route("/api/news/<int:news_id>", methods=["DELETE"])
@@ -481,10 +727,63 @@ def update_news(news_id):
 @same_origin_required
 def delete_news(news_id):
     news_item = News.query.get_or_404(news_id)
-    delete_cloud_image(news_item.image_url)
+    if news_item.image_url:
+        for img_url in news_item.image_url.split(","):
+            delete_cloud_image(img_url.strip())
     db.session.delete(news_item)
     db.session.commit()
-    return jsonify({"message": "News deleted"}), 200
+    return jsonify({"message": "News deleted successfully!"}), 200
+
+
+@app.route("/api/newspapers", methods=["GET"])
+def get_newspapers():
+    newspapers = Newspaper.query.order_by(Newspaper.date_published.desc()).all()
+    return jsonify([n.to_dict() for n in newspapers]), 200
+
+
+@app.route("/api/newspapers", methods=["POST"])
+@login_required
+@same_origin_required
+def add_newspaper():
+    title = normalize_text(request.form.get("title"), max_length=200)
+    pdf_file = request.files.get("pdf")
+    thumbnail_file = request.files.get("thumbnail")
+
+    if not title or not pdf_file:
+        return jsonify({"message": "Title and PDF file are required"}), 400
+
+    try:
+        pdf_url = upload_request_pdf(pdf_file, prefix="newspaper")
+        thumbnail_url = None
+        if thumbnail_file:
+            thumbnail_url = upload_request_image(thumbnail_file, prefix="newspaper_thumb")
+
+        new_issue = Newspaper(
+            title=title,
+            pdf_url=pdf_url,
+            thumbnail_url=thumbnail_url
+        )
+        db.session.add(new_issue)
+        db.session.commit()
+        return jsonify({"message": "Newspaper added successfully!"}), 201
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"message": f"Failed to upload: {exc}"}), 500
+
+
+@app.route("/api/newspapers/<int:newspaper_id>", methods=["DELETE"])
+@login_required
+@same_origin_required
+def delete_newspaper(newspaper_id):
+    issue = Newspaper.query.get_or_404(newspaper_id)
+    if issue.pdf_url:
+        delete_cloud_image(issue.pdf_url)
+    if issue.thumbnail_url:
+        delete_cloud_image(issue.thumbnail_url)
+    db.session.delete(issue)
+    db.session.commit()
+    return jsonify({"message": "Newspaper deleted successfully!"}), 200
 
 
 @app.route("/api/gallery", methods=["GET"])
@@ -497,25 +796,133 @@ def get_gallery():
 @login_required
 @same_origin_required
 def upload_image():
-    file_storage = request.files.get("image")
-    if not file_storage:
-        return jsonify({"message": "No image part"}), 400
-    if not file_storage.filename:
-        return jsonify({"message": "No selected file"}), 400
-
-    try:
-        cloud_url = upload_request_image(file_storage, prefix="gallery")
-    except ValueError as exc:
-        return jsonify({"message": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"message": f"Upload failed: {exc}"}), 500
+    files = request.files.getlist("image")
+    if not files or all(not f.filename for f in files):
+        return jsonify({"message": "No image selected"}), 400
 
     caption = normalize_text(request.form.get("caption"), max_length=255)
-    new_image = GalleryImage(filename=cloud_url, caption=caption)
-    db.session.add(new_image)
+    uploaded = 0
+    errors = []
+
+    for file_storage in files:
+        if not file_storage or not file_storage.filename:
+            continue
+        try:
+            cloud_url = upload_request_image(file_storage, prefix="gallery")
+            new_image = GalleryImage(filename=cloud_url, caption=caption)
+            db.session.add(new_image)
+            uploaded += 1
+        except ValueError as exc:
+            errors.append(f"{file_storage.filename}: {exc}")
+        except Exception as exc:
+            errors.append(f"{file_storage.filename}: {exc}")
+
     db.session.commit()
 
-    return jsonify({"message": "Image uploaded successfully"}), 201
+    if uploaded == 0:
+        return jsonify({"message": "No images uploaded. " + "; ".join(errors)}), 400
+
+    msg = f"{uploaded} image(s) uploaded successfully."
+    if errors:
+        msg += f" {len(errors)} failed: " + "; ".join(errors)
+    return jsonify({"message": msg}), 201
+
+
+@app.route("/api/proxy-pdf")
+def proxy_pdf():
+    url = request.args.get("url")
+    if not url:
+        return "Missing URL", 400
+    
+    # Simple validation: only allow R2 or own origin
+    allowed_domains = ["r2.dev", "127.0.0.1", "localhost"]
+    parsed_url = urlparse(url)
+    if not any(domain in parsed_url.netloc for domain in allowed_domains):
+        return "Unauthorized domain", 403
+
+    import requests as py_requests
+    try:
+        resp = py_requests.get(url, stream=True)
+        headers = dict(resp.headers)
+        # Remove some headers that might cause issues
+        headers.pop("Transfer-Encoding", None)
+        headers.pop("Content-Encoding", None)
+        return (resp.content, resp.status_code, headers.items())
+    except Exception as e:
+        return str(e), 500
+
+
+# --- EVENTS API ---
+
+@app.route("/api/events", methods=["GET"])
+def get_events():
+    # Fetch all events. In a real scenario we might order by date_event
+    events = Event.query.order_by(Event.id.asc()).all()
+    return jsonify({"events": [e.to_dict() for e in events]}), 200
+
+
+@app.route("/api/events", methods=["POST"])
+@login_required
+@same_origin_required
+def add_event():
+    data = request.json
+    if not data or not data.get("title") or not data.get("date_event"):
+        return jsonify({"message": "Въведете заглавие и дата"}), 400
+    
+    new_event = Event(
+        title=data.get("title"),
+        date_event=data.get("date_event"),
+        time_event=data.get("time_event", ""),
+        location=data.get("location", ""),
+        description=data.get("description", "")
+    )
+    db.session.add(new_event)
+    db.session.commit()
+    return jsonify({"message": "Събитието е добавено успешно!", "event": new_event.to_dict()}), 201
+
+
+@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+@login_required
+@same_origin_required
+def delete_event(event_id):
+    event = Event.query.get_or_404(event_id)
+    db.session.delete(event)
+    db.session.commit()
+    return jsonify({"message": "Събитието е изтрито"}), 200
+
+
+@app.route("/api/events/<int:event_id>", methods=["PUT"])
+@login_required
+@same_origin_required
+def update_event(event_id):
+    event = Event.query.get_or_404(event_id)
+    data = request.json
+    if not data or not data.get("title") or not data.get("date_event"):
+        return jsonify({"message": "Въведете заглавие и дата"}), 400
+    
+    event.title = data.get("title")
+    event.date_event = data.get("date_event")
+    event.time_event = data.get("time_event", "")
+    event.location = data.get("location", "")
+    event.description = data.get("description", "")
+    
+    db.session.commit()
+    return jsonify({"message": "Събитието е обновено!", "event": event.to_dict()}), 200
+
+
+@app.route("/admin/<path:filename>")
+def admin_static(filename):
+    return send_from_directory(os.path.join(BASE_DIR, "..", "admin"), filename)
+
+
+@app.route("/admin/")
+def admin_index():
+    return send_from_directory(os.path.join(BASE_DIR, "..", "admin"), "index.html")
+
+
+@app.route("/<path:filename>")
+def root_static(filename):
+    return send_from_directory(os.path.join(BASE_DIR, ".."), filename)
 
 
 @app.route("/api/gallery/<int:image_id>", methods=["DELETE"])

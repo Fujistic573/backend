@@ -57,3 +57,39 @@ class GalleryImage(db.Model):
             'caption': self.caption,
             'date_uploaded': self.date_uploaded.strftime('%Y-%m-%d %H:%M:%S')
         }
+
+class Newspaper(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    pdf_url = db.Column(db.String(500), nullable=False)
+    thumbnail_url = db.Column(db.String(500))  # Link to cover image
+    date_published = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'pdf_url': self.pdf_url,
+            'thumbnail_url': self.thumbnail_url,
+            'date_published': self.date_published.strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+class Event(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    date_event = db.Column(db.String(50), nullable=False) # e.g., "2026-05-24" or "24 Май"
+    time_event = db.Column(db.String(50))                 # e.g., "18:30 ч."
+    location = db.Column(db.String(200))                  # e.g., "Лятна сцена"
+    description = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'date_event': self.date_event,
+            'time_event': self.time_event,
+            'location': self.location,
+            'description': self.description,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        }
